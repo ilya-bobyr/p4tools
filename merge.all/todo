@@ -1,0 +1,11 @@
+TODO:
+
+- Store generated change description in the status file between 'description'
+  and 'changelist' operations, otherwise in case of an error description is not
+  preserved.
+
+BUGS:
+
+DONE:
+
+ vim: set tw=80 et sw=2 sts=2 ts=2 fo+=n:

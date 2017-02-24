@@ -1,0 +1,412 @@
+#!/bin/bash
+
+sourcePattern=
+targetPattern=
+
+declare -a patternList
+patternList=(
+  //test/tmos/%b/automation/fit/
+  //test/maint/%b/automation/fit/
+  //test/tmos/releases/%b/automation/fit/
+  //depot/project/asmtest/%b/
+)
+
+#
+# === End of configuration ===
+#
+
+set -o pipefail
+
+function usage() {
+  cat <<-EOM
+		Creates a changeset that integrates specified changeset from another
+		branch or appends changes into an existing changelist.  In most cases
+		it will automatically figure out source branch from the specified
+		changeset and use current branch as the target.
+		
+		The following path patterns will be checked for both source and target
+		to see what branches your worksapce and changelist files are in:
+		
+		EOM
+
+  printf '  %s\n' "${patternList[@]}"
+
+  cat <<-EOM
+		
+		Branch name is the '%b' component of the patters.
+		
+		Usage:
+		  $( basename $0 ) [-fm] [-c <changelist to append>]
+		       [-t <target path pattern>] [-s <source path pattern>]
+		       <submitted changelist>
+		
+		      -c <changelist> - adds changes into the target changelist,
+		           instead of creating a new one.  Changelist description will
+		           be appended with the integration details, similar to the
+		           text used for the new chanelist description.
+		
+		      -f - pass -f to p4 integrate in order to force integration of a
+		           changelist Perfoce treast as one already integrated.
+		
+		      -m - Run "p4 resolve" with the "-am", instead of "-as" that is
+		           used if this option is not specified.
+		
+		      -s <source path pattern> - defines a pattern to match against the
+		           source path to separate branch prefix, branch name and path
+		           within a branch.
+		           '%b' could be used to mark path component that is the branch
+		           name.  If absent, '%b/' is automatically appended.
+		
+		      -t <target path pattern> - same as '-s' but for target path.
+
+    Also see documentation on Confluence:
+
+      https://docs.f5net.com/display/PDSECAUTOTEAM/Code+Integration#CodeIntegration-p4.cherry
+		
+		EOM
+}
+
+function processArguments() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  p4intOpts=-d
+  existingCL=
+  merge=
+  while getopts ":c:fhms:t:" opt; do
+    case $opt in
+      c) existingCL=$OPTARG
+        ;;
+
+      f) p4intOpts="$p4intOpts -f"
+        ;;
+
+      h)
+        usage
+        exit 1
+        ;;
+
+      m)
+        merge=yes
+        ;;
+
+      s) sourcePattern=$OPTARG
+        ;;
+
+      t) targetPattern=$OPTARG
+        ;;
+
+      \?)
+        echo "Error: Unexpected argument: -$OPTARG" >&2
+        exit 1
+        ;;
+
+      :)
+        echo "Error: Option -$OPTARG requires an argument." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ $# -lt $OPTIND ]]; then
+    echo "Error: A change list number has to be provided." >&2
+    exit 1
+  fi
+
+  sourceCL=${!OPTIND}
+  ((++OPTIND))
+
+  if [[ $# -ge $OPTIND ]]; then
+    echo "Error: Unexpected argument: ${!OPTIND}" >&2
+    exit 1
+  fi
+}
+
+scratch=$( mktemp -d -t "p4.cherry.tmp.XXXXXXXXXX" )
+function cleanup {
+  [[ -e $scratch ]] && rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+# Tries to guess source and target branch names if they are not provided.
+function calculateBranches() {
+  declare -a list
+
+  if ! p4 where 1>"$scratch/where.list" 2>"$scratch/where.err" ; then
+    cat <<EOF
+Error: Failed to get current workspace mapping.
+Command: p4 where
+Output:
+EOF
+    cat "$scratch/where.list" | sed -e 's/^/  /'
+    echo "Error output:"
+    cat "$scratch/where.err" | sed -e 's/^/  /'
+    exit 1
+  fi
+
+  if [[ $targetPattern = '' ]]; then
+    list=("${patternList[@]}")
+  else
+    list=("$targetPattern")
+  fi
+
+  for pattern in "${list[@]}"; do
+    pattern=$( adjustPattern "$pattern" )
+
+    # We assume that the first line that start with '/' could be used to guess
+    # our current branch.  It is not necessary true in all the cases.
+    # TODO Add a check to make sure we would not guess wrong.
+    targetBranch=$( cat "$scratch/where.list" | \
+      sed -ne '\#^'"${pattern%%%b*}[^/]\+${pattern#*%b}"'# {
+          s#^'"${pattern%%%b*}\([^/]\+\)${pattern#*%b}"'.*#\1#p; q }' )
+
+    [[ $targetBranch = '' ]] || break
+  done
+
+  if [[ $targetBranch = '' ]]; then
+    echo "Error: Failed to calculate target branch."
+    echo "  Pattern list:"
+    printf '    %s\n' "${list[@]}"
+    echo "See '$( basename $0 ) -h' for details."
+    exit 1
+  fi
+
+  targetPath=${pattern%%%b*}${targetBranch}${pattern#*%b}
+
+  if ! p4 describe -s "$sourceCL" \
+    1>"$scratch/describe.list" 2>"$scratch/describe.err" ; then
+
+    cat <<EOF
+Error: Failed to get changelist description.
+Command: p4 describe -s "$sourceCL"
+Output:
+EOF
+    cat "$scratch/describe.list" | sed -e 's/^/  /'
+    echo "Error output:"
+    cat "$scratch/describe.err" | sed -e 's/^/  /'
+    exit 1
+  fi
+
+  if [[ $sourcePattern = '' ]]; then
+    list=("${patternList[@]}")
+  else
+    list=("$sourcePattern")
+  fi
+
+  for pattern in "${list[@]}"; do
+    pattern=$( adjustPattern "$pattern" )
+
+    # We assume that the fist changed file will be on the source branch.
+    # TODO Check all the other files and make sure they are not on any other
+    # branches as it may break then.
+    sourceBranch=$( cat "$scratch/describe.list" | \
+      sed -ne '/^\.\.\./ { 
+          s#^... '"${pattern%%%b*}\([^/]\+\)${pattern#*%b}"'.*#\1#p; q }' )
+
+    [[ $sourceBranch = '' ]] || break
+  done
+
+  if [[ $sourceBranch = '' ]]; then
+    echo "Error: Failed to calculate source branch."
+    echo "  Pattern list:"
+    printf '    %s\n' "${list[@]}"
+    echo "See '$( basename $0 ) -h' for details."
+    exit 1
+  fi
+
+  sourcePath=${pattern%%%b*}${sourceBranch}${pattern#*%b}
+
+  unset -v list
+}
+
+# Normalizes a pattern a bit, also making sure that '%b' is present.
+function adjustPattern() {
+  adjusted=$1
+  if [[ "z${adjusted%/}" = "z$adjusted" ]]; then
+    adjusted=$adjusted/
+  fi
+
+  if [[ "z${adjusted#*%b}" = "z$adjusted" ]]; then
+    adjusted=$adjusted%b/
+  fi
+
+  echo "$adjusted"
+}
+
+#
+# === Execution ===
+#
+
+processArguments "$@"
+
+scratch=$( mktemp -d -t "$( basename $0 ).tmp.XXXXXXXXXX" )
+function cleanup {
+  [[ -e $scratch ]] && rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+calculateBranches
+
+echo "Target branch: $targetBranch"
+echo "Source branch: $sourceBranch"
+echo
+echo "    ${sourcePath}... => ${targetPath}..."
+echo
+
+# We do not need the list of jobs or affected files as we will get those
+# separately later.
+( p4 describe -s "$sourceCL" | sed -ne '
+    s/^Jobs fixed \.\.\.//
+    t end
+    s/^Affected files \.\.\.//
+    t end
+    p
+    b
+    :end
+    q
+  ' ) \
+  || {
+  echo "Error: p4 describe -s \"$sourceCL\" failed."
+  exit 2
+}
+
+if [[ $existingCL = '' ]]; then
+  # XXX When change description contains our default template, a server script
+  # will automatically insert "Jobs:" marker after it creating invalid change
+  # list.  So we remove the "<enter description here>" line that is followed by
+  # an optional whitespace line and a line with the "RQ:" tag.
+  #
+  # Subsequent sed is used to extract just the change description.  Third
+  # and forth invocation remove leading and trailing blank lines.
+  description=$( p4 describe -s "$sourceCL" | \
+    sed -e '
+      /^\s*<\?enter description here>\?\s*$/{
+        # Take the next line.
+        N
+        # Add one more line if we appended an all whitespace line.
+        /\n\s*$/{ s/\n\s*//; N }
+        # Remove both lines if the second one is that RQ: line.
+        /\n\s*RQ:\s*$/d
+      }' | \
+    sed -ne '/^Change /,/^[^\t]/ { /^[^\t]/d; p }' | \
+    sed -e '/^\s*\S/,$!d' | \
+    sed -e ':a; /^\n*$/ { $d; N; ba }' )
+
+  targetCL=$( p4 change -i <<EOF | cut -d ' ' -f 2
+Change: new
+$( p4 change -o | grep '^Client:\|^User:' )
+Description:
+$description
+	
+	p4 integrate $p4intOpts
+	    "${sourcePath}...@${sourceCL},@${sourceCL}"
+	    "${targetPath}..."
+EOF
+  )
+else
+  # Similar to the description processing above, except that in case we
+  # want the "Change <number> ..." line in as well.  We also add extra
+  # indentation in this case.
+  description=$( p4 describe -s "$sourceCL" | \
+    sed -e '
+      /^\s*<\?enter description here>\?\s*$/{
+        # Take the next line.
+        N
+        # Add one more line if we appended an all whitespace line.
+        /\n\s*$/{ s/\n\s*//; N }
+        # Remove both lines if the second one is that RQ: line.
+        /\n\s*RQ:\s*$/d
+      }' | \
+    sed -ne '/^Change /,/^[^\t]/ { /^[^\t]/d; p }' | \
+    sed -e '/^\s*\S/,$!d' | \
+    sed -e ':a; /^\n*$/ { $d; N; ba }' | \
+    sed -e 's/^/	/' )
+
+  targetCL=$existingCL
+
+  # Append new change description to the existing changelist.
+  p4 change -i <<EOF || {
+$( p4 change -o "$targetCL" | \
+  sed -ne '1,/^\(Jobs\|Files\):/ { /^\(Jobs\|Files\):/q; p }' )
+	
+$description
+	
+	\$ p4 integrate $p4intOpts
+	    "${sourcePath}...@${sourceCL},@${sourceCL}"
+	    "${targetPath}..."
+	
+$( p4 change -o "$targetCL" | \
+  sed -ne '/^\(Jobs\|Files\):/,$p' )
+EOF
+    echo "Error: p4 change -u -i failed."
+    exit 2
+  }
+fi
+
+jobs=$( p4 describe -s "$sourceCL" | \
+  sed -ne '/^Jobs fixed /,/^Affected files/ { s/^\([0-9]\+\).*/\1/p }' )
+
+for job in $jobs; do
+  p4 fix -c "$targetCL" "$job"
+done
+
+p4output=$(
+  p4 integrate -q -c "$targetCL" $p4intOpts \
+    "${sourcePath}...@${sourceCL},@${sourceCL}" \
+    "${targetPath}..." \
+  2>"$scratch/int.err" )
+
+if [[ "$p4output" != '' ]]; then
+  echo "Error: Unexpected output:"
+  echo "    p4 integrate -q -c \"$targetCL\" $p4intOpts \"${sourcePath}...@${sourceCL},@${sourceCL}\" \"${targetPath}...\""
+  echo "$p4output" | sed -e 's/^/    /'
+  exit 2
+fi
+
+if [[ -s "$scratch/int.err" ]]; then
+  if [[ "$(< "$scratch/int.err" )" =~ \
+          'all revision(s) already integrated.' ]]; then
+    echo "Error: p4 integrate: Nothing to integrate."
+    cat "$scratch/int.err" | sed -e 's/^/    /'
+    echo
+    echo "    Prefixes and/or branches may have been incorrect."
+    if [[ ! $p4intOpts =~ '-f' ]]; then
+      echo "    You may want to pass '-f' to retry integration ignoring"
+      echo "    the integration history."
+    fi
+
+    # As '-f' does not seem to work I have to patch files "manually" quite
+    # often.  In those cases it is convenient to have a changelist prepared for
+    # me.  If we teach this script how to do the "manuall" patching only then
+    # it would make sense to automatically remove change generated changelist.
+    # p4 change -d "$targetCL" >/dev/null
+  else
+    echo "Error: p4 integrate: Unexpected error."
+    cat "$scratch/int.err" | sed -e 's/^/  /'
+  fi
+
+  if [[ $existingCL = '' ]]; then
+    echo "New changeset: $targetCL"
+  else
+    echo "Affected changeset: $targetCL"
+  fi
+
+  exit 1
+fi
+
+if [[ $merge = '' ]]; then
+  p4 resolve -c "$targetCL" -as
+else
+  p4 resolve -c "$targetCL" -am
+fi
+ 
+echo
+if [[ $existingCL = '' ]]; then
+  echo "New changeset: $targetCL"
+else
+  echo "Affected changeset: $targetCL"
+fi
+
+# vim: sw=2 sts=2 ts=2 et:
