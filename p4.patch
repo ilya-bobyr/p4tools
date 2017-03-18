@@ -1,0 +1,174 @@
+#!/bin/bash
+
+#
+# === End of configuration ===
+#
+
+set -o pipefail
+
+function usage() {
+  cat <<-EOM
+		Applies a patch to a Perforce workspace.  Supports added and removed
+		files.
+		
+		Usage:
+		  $( basename $0 ) [-c <changelist to augment with the patch changes>]
+		       <file.patch>
+		
+		      -c <changelist> - adds changes into the target changelist,
+		           instead of creating a new one.
+		
+		EOM
+}
+
+targetCl=
+patchFile=
+
+function processArguments() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  existingCL=
+  while getopts ":c:h" opt; do
+    case $opt in
+      c) existingCL=$OPTARG
+        ;;
+
+      h)
+        usage
+        exit 1
+        ;;
+
+      \?)
+        echo "Error: Unexpected argument: -$OPTARG" >&2
+        exit 1
+        ;;
+
+      :)
+        echo "Error: Option -$OPTARG requires an argument." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ $# -lt $OPTIND ]]; then
+    echo "Error: A patch file has to be provided." >&2
+    exit 1
+  fi
+
+  patchFile=${!OPTIND}
+  ((++OPTIND))
+
+  if [[ ! -r "$patchFile" ]]; then
+    echo "Error: Patch file is not readable: $patchFile" >&2
+    exit 1
+  fi
+
+  if [[ $# -ge $OPTIND ]]; then
+    echo "Error: Unexpected argument: ${!OPTIND}" >&2
+    exit 1
+  fi
+}
+
+function newChangelist () {
+  targetCL=$( p4 change -i <<EOF | cut -d ' ' -f 2
+Change: new
+$( p4 change -o | grep '^Client:\|^User:' )
+Description:
+	Applied patch $patchFile
+EOF
+  )
+}
+
+# Arguments:
+#   1 - Error title.
+#   2 - Error message to output just after the title line.  Not output if empty.
+#   3 - File name whos content is output just after the title line.  Not output
+#       if empty.
+function failed () {
+  echo "Error: $1"
+
+  if [[ $2 != "" ]]; then
+    echo "$2" | sed -e 's/^/  /'
+  fi
+
+  if [ "$3" != "" -a -s "$3" ]; then
+    echo
+    cat "$3" | sed -e 's/^/  /'
+  fi
+
+  exit 1
+}
+
+#
+# === Execution ===
+#
+
+processArguments "$@"
+
+scratch=$( mktemp -d -t "p4.patch.tmp.XXXXXXXXXX" )
+function cleanup {
+  [[ -e $scratch ]] && rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+if [[ $existingCL = '' ]]; then
+  newChangelist
+else
+  targetCL=$existingCL
+fi
+
+# Delete is not implemented at the moment.
+# TODO: Need to extract deleted files content from the patch and compare to
+# the existing files.  If there are any differences - show them as
+# conflicts and exit.  Otherwise "p4 delete" the files.
+sed -ne '
+  \@^--- @! d
+  s@^--- @@
+  \@/dev/null@ d
+
+  h
+  n
+  \@^+++ /dev/null@! d
+
+  x
+  p
+  ' "$patchFile" | \
+    while read -r file; do
+      echo "Deletions are not implemented yet."
+      echo "Patch is trying to delete this file: $file"
+      exit 1
+    done
+
+# "p4 edit" files that are are going to change.
+sed -ne '
+  \@^--- @! d
+  s@^--- @@
+  \@/dev/null@ d
+  p
+  ' "$patchFile" | \
+    p4 -x - edit -c "$targetCL" 2>"$scratch/edit.err" || \
+    failed "p4 edit failed" "" "$scratch/edit.err"
+
+patch -p0 <"$patchFile" 2>"$scratch/patch.err" || \
+  failed "patch -p0 '$patchFile' failed" "" "$scratch/patch.err"
+
+# "p4 add" new files.
+sed -ne '
+  \@^--- @! d
+  s@^--- @@
+  \@/dev/null@! d
+
+  n
+  \@^+++ @! d
+  s@^+++ @@
+  \@^/dev/null@ d
+
+  p
+  ' "$patchFile" | \
+    p4 -x - add -c "$targetCL" 2>"$scratch/add.err" || \
+    failed "p4 add failed" "" "$scratch/add.err"
+
+# vim: sw=2 sts=2 ts=2 et:
